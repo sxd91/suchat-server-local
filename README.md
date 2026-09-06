@@ -27,11 +27,11 @@ All user routes except register/login send `Authorization: Bearer <accessToken>`
 | People & contacts | `GET /api/v1/users/search?q=`, `GET/POST /api/v1/contacts`, `DELETE /api/v1/contacts/:userId` |
 | Conversations | `GET/POST /api/v1/conversations`, `GET/POST /api/v1/conversations/:id/messages` |
 | Social | `GET/POST /api/v1/moments`, `DELETE /api/v1/moments/:id`, `GET/POST /api/v1/bottles`, `POST /api/v1/bottles/:id/pick` |
-| Local upload metadata | `GET /api/v1/uploads`, `POST /api/v1/uploads/metadata` |
+| Local uploads | `GET /api/v1/uploads`, `POST /api/v1/uploads/metadata`, `PUT /api/v1/uploads/:id/content`, `GET /api/v1/uploads/:id/content` |
 | Notifications & reports | `GET /api/v1/notifications`, `POST /api/v1/notifications/:id/read`, `POST /api/v1/reports` |
 | Admin | `POST /api/admin/v1/auth/login`, `GET /api/admin/v1/dashboard`, `GET /api/admin/v1/users`, `GET/PATCH /api/admin/v1/reports`, `GET /api/admin/v1/system/status` |
 
-The upload endpoint records metadata only; a storage transport can be connected later using its `storageKey` field. Generated database files, upload data, and `node_modules` are ignored by Git.
+Create metadata with `fileName` and `mimeType`; its response includes `uploadUrl` and `contentUrl`. Send the raw binary request body to `uploadUrl` with an authenticated `PUT`. The server assigns a safe storage key and writes content under `data/uploads`; only the owning user can upload or download content, and downloads use the stored MIME type. Generated database files, upload data, and `node_modules` are ignored by Git.
 
 ## LAN access from an Android phone
 
