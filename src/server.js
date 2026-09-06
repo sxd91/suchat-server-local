@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
 import fastifyStatic from '@fastify/static';
+import websocket from '@fastify/websocket';
 import { DatabaseSync } from 'node:sqlite';
 import jwt from 'jsonwebtoken';
 import fs from 'node:fs';
@@ -52,6 +53,15 @@ if (!one('SELECT id FROM admins WHERE handle = ?', adminHandle)) run('INSERT INT
 const app = Fastify({ logger: false });
 await app.register(cookie);
 await app.register(fastifyStatic, { root: adminDir, prefix: '/admin/' });
+await app.register(websocket);
+const socketsByUser = new Map();
+const publish = (userIds, event, data) => {
+  for (const userId of userIds) {
+    for (const socket of socketsByUser.get(userId) || []) {
+      if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ event, data }));
+    }
+  }
+};
 app.addHook('onRequest', async (request, reply) => { reply.header('Access-Control-Allow-Origin', request.headers.origin || '*'); reply.header('Access-Control-Allow-Credentials', 'true'); reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization'); });
 app.options('*', async (_, reply) => reply.code(204).send());
 const tokenFrom = (request) => request.headers.authorization?.replace(/^Bearer\s+/i, '');
@@ -63,6 +73,18 @@ const requireBody = (reply, value, error) => value ? null : reply.code(400).send
 const isMember = (conversationId, userId) => one('SELECT 1 FROM conversation_members WHERE conversation_id=? AND user_id=?', conversationId, userId);
 const uploadsBytes = () => all('SELECT byte_size FROM uploads').reduce((total, row) => total + row.byte_size, 0);
 
+app.get('/ws', { websocket: true }, (socket, request) => {
+  const token = request.query?.access_token || tokenFrom(request);
+  try {
+    const session = jwt.verify(token, secret);
+    if (session.kind !== 'user') throw new Error('not_user');
+    const userSockets = socketsByUser.get(session.sub) || new Set();
+    userSockets.add(socket);
+    socketsByUser.set(session.sub, userSockets);
+    socket.send(JSON.stringify({ event: 'connected', data: { userId: session.sub, time: now() } }));
+    socket.on('close', () => { userSockets.delete(socket); if (userSockets.size === 0) socketsByUser.delete(session.sub); });
+  } catch { socket.close(1008, 'auth_required'); }
+});
 app.get('/api/v1/health', async () => ({ status: 'ok', service: 'suchat-server-local', version: '0.2.0', time: now(), database: 'ready' }));
 app.get('/api/v1/meta', async () => ({ name: 'Suchat Local Server', apiVersion: 'v1', websocketUrl: 'ws://' + host + ':' + port + '/ws', features: { moments: true, driftBottles: true, localUpload: true, adminWeb: true } }));
 app.post('/api/v1/auth/register', async (request, reply) => { const b = request.body || {}; if (requireBody(reply, b.handle && b.displayName && b.password, 'handle_displayName_password_required')) return; if (one('SELECT id FROM users WHERE handle=?', b.handle)) return reply.code(409).send({ error: 'handle_taken' }); const id = makeId('usr'); const createdAt = now(); run('INSERT INTO users (id,handle,display_name,password,status,created_at,last_seen_at) VALUES (?,?,?,?,?,?,?)', id, b.handle, b.displayName, b.password, 'active', createdAt, createdAt); run('INSERT INTO settings (user_id) VALUES (?)', id); return { user: publicUser(one('SELECT * FROM users WHERE id=?', id)), tokens: { accessToken: jwt.sign({ sub: id, kind: 'user' }, secret, { expiresIn: '7d' }) } }; });
@@ -84,7 +106,7 @@ app.delete('/api/v1/contacts/:userId', { preHandler: auth }, async (request, rep
 app.get('/api/v1/conversations', { preHandler: auth }, async (request) => ({ items: all(`SELECT c.id,c.kind,c.title,c.created_at AS createdAt,c.updated_at AS updatedAt, (SELECT content FROM messages m WHERE m.conversation_id=c.id AND m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT 1) AS lastMessage FROM conversations c JOIN conversation_members cm ON cm.conversation_id=c.id WHERE cm.user_id=? ORDER BY c.updated_at DESC`, request.user.sub) }));
 app.post('/api/v1/conversations', { preHandler: auth }, async (request, reply) => { const b = request.body || {}; const members = [...new Set([request.user.sub, ...(Array.isArray(b.memberIds) ? b.memberIds : [])])]; if (members.length < 2 && b.kind !== 'self') return reply.code(400).send({ error: 'memberIds_required' }); if (members.some(id => !one('SELECT id FROM users WHERE id=?', id))) return reply.code(404).send({ error: 'member_not_found' }); const id = makeId('cv'); const t = now(); run('INSERT INTO conversations (id,kind,title,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, b.kind || 'direct', b.title || null, request.user.sub, t, t); for (const memberId of members) run('INSERT INTO conversation_members (conversation_id,user_id,role,joined_at) VALUES (?,?,?,?)', id, memberId, memberId === request.user.sub ? 'owner' : 'member', t); return reply.code(201).send({ id, kind: b.kind || 'direct', title: b.title || null, memberIds: members, createdAt: t }); });
 app.get('/api/v1/conversations/:id/messages', { preHandler: auth }, async (request, reply) => { if (!isMember(request.params.id, request.user.sub)) return reply.code(403).send({ error: 'conversation_access_denied' }); return { items: all('SELECT m.id,m.conversation_id AS conversationId,m.sender_id AS senderId,m.content,m.content_type AS contentType,m.attachment_id AS attachmentId,m.created_at AS createdAt,m.edited_at AS editedAt FROM messages m WHERE m.conversation_id=? AND m.deleted_at IS NULL ORDER BY m.created_at ASC LIMIT 200', request.params.id) }; });
-app.post('/api/v1/conversations/:id/messages', { preHandler: auth }, async (request, reply) => { if (!isMember(request.params.id, request.user.sub)) return reply.code(403).send({ error: 'conversation_access_denied' }); const b = request.body || {}; if (requireBody(reply, b.content || b.attachmentId, 'content_or_attachmentId_required')) return; const id = makeId('msg'); const t = now(); run('INSERT INTO messages (id,conversation_id,sender_id,content,content_type,attachment_id,created_at) VALUES (?,?,?,?,?,?,?)', id, request.params.id, request.user.sub, b.content || '', b.contentType || 'text', b.attachmentId || null, t); run('UPDATE conversations SET updated_at=? WHERE id=?', t, request.params.id); return reply.code(201).send(one('SELECT id,conversation_id AS conversationId,sender_id AS senderId,content,content_type AS contentType,attachment_id AS attachmentId,created_at AS createdAt FROM messages WHERE id=?', id)); });
+app.post('/api/v1/conversations/:id/messages', { preHandler: auth }, async (request, reply) => { if (!isMember(request.params.id, request.user.sub)) return reply.code(403).send({ error: 'conversation_access_denied' }); const b = request.body || {}; if (requireBody(reply, b.content || b.attachmentId, 'content_or_attachmentId_required')) return; const id = makeId('msg'); const t = now(); run('INSERT INTO messages (id,conversation_id,sender_id,content,content_type,attachment_id,created_at) VALUES (?,?,?,?,?,?,?)', id, request.params.id, request.user.sub, b.content || '', b.contentType || 'text', b.attachmentId || null, t); run('UPDATE conversations SET updated_at=? WHERE id=?', t, request.params.id); const message = one('SELECT id,conversation_id AS conversationId,sender_id AS senderId,content,content_type AS contentType,attachment_id AS attachmentId,created_at AS createdAt FROM messages WHERE id=?', id); publish(all('SELECT user_id FROM conversation_members WHERE conversation_id=?', request.params.id).map(row => row.user_id), 'message.created', message); return reply.code(201).send(message); });
 
 app.get('/api/v1/moments', { preHandler: auth }, async () => ({ items: all('SELECT m.id,m.author_id AS authorId,m.content,m.visibility,m.created_at AS createdAt,u.handle,u.display_name AS displayName,u.avatar_url AS avatarUrl FROM moments m JOIN users u ON u.id=m.author_id WHERE m.deleted_at IS NULL ORDER BY m.created_at DESC LIMIT 100') }));
 app.post('/api/v1/moments', { preHandler: auth }, async (request, reply) => { const b = request.body || {}; if (requireBody(reply, b.content || (b.uploadIds && b.uploadIds.length), 'content_or_uploadIds_required')) return; const id = makeId('mom'); const t = now(); run('INSERT INTO moments (id,author_id,content,visibility,created_at) VALUES (?,?,?,?,?)', id, request.user.sub, b.content || '', b.visibility || 'contacts', t); for (const [sortOrder, uploadId] of (b.uploadIds || []).entries()) run('INSERT INTO moment_media (id,moment_id,upload_id,sort_order) VALUES (?,?,?,?)', makeId('mm'), id, uploadId, sortOrder); return reply.code(201).send({ id, authorId: request.user.sub, content: b.content || '', visibility: b.visibility || 'contacts', createdAt: t }); });
